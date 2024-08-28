@@ -68,18 +68,3 @@ This project implements a group chat application using Java sockets, enabling co
 4. Clients can send messages, which are then broadcast to all other connected clients.
 5. When a client disconnects, the server removes it from the list of active clients.
 
-## Future Improvements
-
-- Implement private messaging between clients
-- Add support for file sharing
-- Implement a graphical user interface (GUI) for the client
-- Add server-side logging and chat history
-- Implement user authentication and secure communication (e.g., SSL/TLS)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is open source and available under the [MIT License](LICENSE).
