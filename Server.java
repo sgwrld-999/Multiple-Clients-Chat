@@ -1,21 +1,24 @@
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.*;
-import java.util.Iterator;
-import java.util.Set;
+import javax.net.ssl.*;
+import java.io.*;
+import java.net.*;
+import java.security.KeyStore;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class Server {
     private static final Logger logger = Logger.getLogger(Server.class.getName());
+    private static final int PORT = 1234;
+    private static final int MAX_CONNECTIONS = 100; // Limit simultaneous connections
+    private static final String KEYSTORE_FILE = "keystore.jks";
+    private static final String KEYSTORE_PASSWORD = "changeit";
 
-    private static final int DEFAULT_PORT = 1234;
-    private static final int BUFFER_SIZE = 1024;
     private final ConnectionManager connectionManager;
     private final ExecutorService executorService;
     private volatile boolean running = true;
+    private static final AtomicInteger activeConnections = new AtomicInteger(0);
+    private final RateLimiter rateLimiter = new RateLimiter();
 
     public Server() {
         this.connectionManager = new ConnectionManager();
@@ -26,112 +29,58 @@ public class Server {
         ).getExecutor();
     }
 
-    public void startServer(int port) {
-        try (Selector selector = Selector.open();
-             ServerSocketChannel serverChannel = ServerSocketChannel.open()) {
+    public void startServer() {
+        try {
+            // Load the keystore
+            KeyStore keyStore = KeyStore.getInstance("JKS");
+            try (FileInputStream keyStoreStream = new FileInputStream(KEYSTORE_FILE)) {
+                keyStore.load(keyStoreStream, KEYSTORE_PASSWORD.toCharArray());
+            }
 
-            serverChannel.bind(new InetSocketAddress(port));
-            serverChannel.configureBlocking(false);
-            serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+            // Initialize KeyManagerFactory
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance("SunX509");
+            kmf.init(keyStore, KEYSTORE_PASSWORD.toCharArray());
 
-            logger.info("Server started on port " + port);
+            // Initialize SSLContext
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(kmf.getKeyManagers(), null, null);
 
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                logger.info("Shutdown initiated. Closing server...");
-                running = false;
-                try {
-                    selector.close();
-                    serverChannel.close();
-                    executorService.shutdown();
-                } catch (IOException e) {
-                    logger.log(Level.SEVERE, "Error closing server", e);
-                }
-                logger.info("Server shutdown complete.");
-            }));
+            // Create SSLServerSocket
+            SSLServerSocketFactory ssf = sslContext.getServerSocketFactory();
+            SSLServerSocket serverSocket = (SSLServerSocket) ssf.createServerSocket(PORT);
+
+            logger.info("Secure Chat Server started on port " + PORT);
 
             while (running) {
-                selector.select(); // Wait for an event
-                Set<SelectionKey> keys = selector.selectedKeys();
-                Iterator<SelectionKey> iterator = keys.iterator();
-
-                while (iterator.hasNext()) {
-                    SelectionKey key = iterator.next();
-                    iterator.remove();
-
-                    if (key.isAcceptable()) {
-                        acceptClient(selector, serverChannel);
-                    } else if (key.isReadable()) {
-                        handleClientMessage(selector, key);
-                    }
+                if (activeConnections.get() >= MAX_CONNECTIONS) {
+                    logger.warning("Max connections reached. Rejecting new clients.");
+                    Thread.sleep(500); // Prevent excessive CPU usage
+                    continue;
                 }
+
+                SSLSocket clientSocket = (SSLSocket) serverSocket.accept();
+                activeConnections.incrementAndGet();
+                logger.info("New client connected. Active connections: " + activeConnections.get());
+
+                new Thread(new ClientHandler(clientSocket, this)).start();
             }
-        } catch (IOException e) {
-            logger.log(Level.SEVERE, "Server encountered an error", e);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error in secure server", e);
         }
     }
 
-    private void acceptClient(Selector selector, ServerSocketChannel serverChannel) throws IOException {
-        SocketChannel clientChannel = serverChannel.accept();
-        if (clientChannel == null) return;
-
-        String clientId = clientChannel.socket().getRemoteSocketAddress().toString();
-        if (!connectionManager.registerClient(clientId, new ConnectionManager.ClientMetadata(clientId))) {
-            logger.warning("Connection limit reached. Rejecting new client: " + clientId);
-            clientChannel.close();
-            return;
-        }
-
-        clientChannel.configureBlocking(false);
-        clientChannel.register(selector, SelectionKey.OP_READ);
-        logger.info("New client connected: " + clientId);
+    // Called when a client disconnects
+    public void decreaseActiveConnections() {
+        activeConnections.decrementAndGet();
+        logger.info("Client disconnected. Active connections: " + activeConnections.get());
     }
 
-    private void handleClientMessage(Selector selector, SelectionKey key) throws IOException {
-        SocketChannel clientChannel = (SocketChannel) key.channel();
-        ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
-
-        int bytesRead = clientChannel.read(buffer);
-        if (bytesRead == -1) {
-            clientChannel.close();
-            String clientId = clientChannel.socket().getRemoteSocketAddress().toString();
-            connectionManager.unregisterClient(clientId);
-            logger.info("Client disconnected: " + clientId);
-        } else {
-            buffer.flip();
-            String message = new String(buffer.array(), 0, bytesRead);
-            logger.info("Received message from client: " + message);
-
-            executorService.submit(() -> {
-                try {
-                    broadcastMessage(selector, clientChannel, message);
-                } catch (IOException e) {
-                    logger.log(Level.SEVERE, "Error broadcasting message", e);
-                }
-            });
-        }
-    }
-
-    private void broadcastMessage(Selector selector, SocketChannel sender, String message) throws IOException {
-        ByteBuffer buffer = ByteBuffer.wrap(message.getBytes());
-
-        for (SelectionKey key : selector.keys()) {
-            if (key.isValid() && key.channel() instanceof SocketChannel && key.channel() != sender) {
-                ((SocketChannel) key.channel()).write(buffer);
-                buffer.rewind();  // Reset buffer for the next client
-            }
-        }
+    // Provide access to rateLimiter for ClientHandler
+    public RateLimiter getRateLimiter() {
+        return rateLimiter;
     }
 
     public static void main(String[] args) {
-        int port = DEFAULT_PORT;
-        if (args.length > 0) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                logger.warning("Invalid port number. Using default port " + DEFAULT_PORT);
-            }
-        }
-
-        new Server().startServer(port);
+        new Server().startServer();
     }
 }

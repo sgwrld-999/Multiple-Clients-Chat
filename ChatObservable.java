@@ -1,4 +1,3 @@
-import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -15,11 +14,8 @@ public class ChatObservable {
 
     public void broadcast(String message) {
         for (ClientHandler client : observers) {
-            try {
-                client.sendMessage(message);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
+            client.sendMessage(message); // Fixed method call
         }
     }
 }
+
